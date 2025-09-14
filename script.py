@@ -9,6 +9,7 @@ import io
 import unicodedata
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+import shutil  # added for copying originals when no face detected
 
 # Attempt lazy import of OpenCV; proceed without cropping if unavailable
 try:
@@ -208,7 +209,8 @@ def parse_katalognummer_and_name(filename):
     return katalog, cleaned_name
 
 
-def create_student_entry(image_path, student_name, img_width, img_height, target_dpi=110, rotation_angle=None, font_name="Helvetica"):
+def create_student_entry(image_path, student_name, img_width, img_height, target_dpi=110, rotation_angle=None, font_name="Helvetica",
+                         save_cropped_root=None, katalog=None, base_name=None, class_folder=None, original_image_path=None):
     """Create (image_flowable, name_paragraph) pair for table cells.
     Enhancements:
       * Optional forced rotation based on class (rotation_angle in degrees, applied if provided).
@@ -217,12 +219,14 @@ def create_student_entry(image_path, student_name, img_width, img_height, target
       * Physically downscale image to fit (img_width,img_height) at target_dpi.
       * Keep JPEG (quality=80) to drastically lower in-memory size.
       * Use a Unicode-capable font for names.
+      * NEW: Save cropped face image (pre-resize) to save_cropped_root/[class]/[katalog]_[name].jpg; if no face detected, copy original.
     img_width / img_height are in POINTS (ReportLab). Converted to pixels using target_dpi.
     """
     styles = getSampleStyleSheet()
     student_name = unicodedata.normalize('NFC', student_name)
     try:
         with PILImage.open(image_path) as im:
+            # Preserve a flag to know if we cropped
             # Apply class-based rotation if specified
             if rotation_angle is not None:
                 try:
@@ -234,7 +238,47 @@ def create_student_entry(image_path, student_name, img_width, img_height, target
                     im = im.rotate(90, expand=True)
             # Face crop step (preserve aspect of allocated cell)
             target_aspect = (img_width / img_height) if img_height else 0.75
-            im = crop_image_to_face(im, target_aspect=target_aspect)
+            before_crop = im
+            im_cropped = crop_image_to_face(im, target_aspect=target_aspect)
+            cropped_performed = (im_cropped is not before_crop)
+
+            # Save cropped (or original) if requested
+            if save_cropped_root and base_name and class_folder:  # removed katalog requirement
+                try:
+                    dest_dir = os.path.join(save_cropped_root, class_folder)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    # Sanitize base_name for filesystem: replace multiple spaces with single underscore
+                    base_clean = ' '.join(base_name.split())
+                    base_clean = base_clean.replace(' ', '_')
+                    katalog_used = katalog if katalog else "00"
+                    dest_filename = f"{katalog_used}_{base_clean}.jpg"
+                    dest_path = os.path.join(dest_dir, dest_filename)
+                    if cropped_performed:
+                        # Save the cropped image (before resizing)
+                        save_im = im_cropped
+                        if save_im.mode not in ("RGB", "L"):
+                            save_im = save_im.convert("RGB")
+                        elif save_im.mode == "L":
+                            save_im = save_im.convert("RGB")
+                        save_im.save(dest_path, format='JPEG', quality=90, optimize=True, progressive=True)
+                    else:
+                        # Copy original file bytes (not the rotated PIL image) to keep exact original if no crop
+                        src_path = original_image_path or image_path
+                        try:
+                            shutil.copy2(src_path, dest_path)
+                        except Exception:
+                            # Fallback: save current (possibly rotated) image if copy fails
+                            temp_im = before_crop
+                            if temp_im.mode not in ("RGB", "L"):
+                                temp_im = temp_im.convert("RGB")
+                            elif temp_im.mode == "L":
+                                temp_im = temp_im.convert("RGB")
+                            temp_im.save(dest_path, format='JPEG', quality=90, optimize=True, progressive=True)
+                except Exception as se:
+                    print(f"⚠️  Failed to save cropped image for {image_path}: {se}")
+
+            # Continue with the (possibly cropped) image for PDF scaling
+            im = im_cropped
             # Compute max pixel dimensions based on target DPI (points -> inches -> pixels)
             max_w_px = max(1, int(round((img_width / 72.0) * target_dpi)))
             max_h_px = max(1, int(round((img_height / 72.0) * target_dpi)))
@@ -425,7 +469,10 @@ def create_pdf():
             display_name = f"{katalog} {base_name}" if katalog else base_name
             display_name = unicodedata.normalize('NFC', display_name)
             img_flow, name_para = create_student_entry(image_path, display_name, max_img_width, max_img_height,
-                                                       rotation_angle=rotation_angle, font_name=unicode_font)
+                                                       rotation_angle=rotation_angle, font_name=unicode_font,
+                                                       save_cropped_root="Klassenfotos_cropped", katalog=katalog,
+                                                       base_name=base_name, class_folder=class_folder,
+                                                       original_image_path=image_path)
 
             # Append two cells (image then name)
             row.extend([img_flow, name_para])
