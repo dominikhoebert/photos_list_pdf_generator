@@ -6,6 +6,9 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from PIL import Image as PILImage
 import io
+import unicodedata
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # Provide a Pillow-version-safe LANCZOS / high-quality resample filter
 try:
@@ -15,7 +18,7 @@ except AttributeError:  # Older / different Pillow
 
 path = "Klassenfotos"
 
-rotation_class = {"2AHIT": 270, "2BHIT": 270, "3AHIT": 270}
+rotation_class = {"2AHIT": 270, "2BHIT": 270, "3AHIT": 270, "4DHIT": 270}
 remove_doubles = {"2BHIT": 1, "3AHIT": 1, "3CHIT": 1, "3DHIT": 1, "4BHIT": 1, "4CHIT": 1}
 
 def extract_student_name(filename):
@@ -28,14 +31,36 @@ def extract_student_name(filename):
     return name.replace('_', ' ')
 
 
+def ensure_unicode_font():
+    """Register and return a Unicode-capable font name.
+    Tries common system fonts (Windows Arial) then falls back to DejaVu if user supplies it.
+    If registration fails, returns a base font (may not render extended characters)."""
+    candidates = [
+        ("ArialUnicode", r"C:\\Windows\\Fonts\\arial.ttf"),  # Windows Arial normal
+        ("Arial", r"C:\\Windows\\Fonts\\arial.ttf"),
+        ("DejaVuSans", "DejaVuSans.ttf"),  # Allow user to drop into project dir
+        ("NotoSans", "NotoSans-Regular.ttf"),
+    ]
+    for font_name, path in candidates:
+        if os.path.isfile(path):
+            try:
+                if font_name not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont(font_name, path))
+                return font_name
+            except Exception as e:
+                print(f"⚠️  Font register failed for {path}: {e}")
+    print("⚠️  No Unicode TTF font registered; extended characters may not display.")
+    return "Helvetica"  # fallback
+
 def parse_katalognummer_and_name(filename):
     """Return (katalognummer(str or None), cleaned_name).
     katalognummer: taken from leading numeric prefix before first underscore; padded to 2 digits.
-    cleaned_name: remaining parts joined with spaces, with any trailing purely numeric tokens removed (e.g., version markers like _2)."""
+    cleaned_name: remaining parts joined with spaces, with any trailing purely numeric tokens removed (e.g., version markers like _2).
+    Applies NFC normalization so composed characters (e.g. 'Ö', 'ć') display properly in PDF fonts."""
     stem = os.path.splitext(filename)[0]
     parts = stem.split('_')
     if not parts:
-        return None, stem
+        return None, unicodedata.normalize('NFC', stem)
     katalog = None
     remaining = parts
     if parts[0].isdigit():
@@ -44,20 +69,24 @@ def parse_katalognummer_and_name(filename):
     while remaining and remaining[-1].isdigit():
         remaining = remaining[:-1]
     cleaned_name = ' '.join(remaining).strip()
-    cleaned_name = ' '.join(cleaned_name.split())  # collapse any repeated whitespace
+    cleaned_name = ' '.join(cleaned_name.split())  # collapse spaces
+    cleaned_name = unicodedata.normalize('NFC', cleaned_name)
     return katalog, cleaned_name
 
 
-def create_student_entry(image_path, student_name, img_width, img_height, target_dpi=110, rotation_angle=None):
+def create_student_entry(image_path, student_name, img_width, img_height, target_dpi=110, rotation_angle=None, font_name="Helvetica"):
     """Create (image_flowable, name_paragraph) pair for table cells.
     Enhancements:
       * Optional forced rotation based on class (rotation_angle in degrees, applied if provided).
       * Otherwise, auto-rotate landscape images to portrait.
       * Physically downscale image to fit (img_width,img_height) at target_dpi.
       * Keep JPEG (quality=80) to drastically lower in-memory size.
+      * Use a Unicode-capable font for names.
     img_width / img_height are in POINTS (ReportLab). Converted to pixels using target_dpi.
     """
     styles = getSampleStyleSheet()
+    # Normalize display name to NFC to avoid combining mark issues (e.g. O8\u0308)
+    student_name = unicodedata.normalize('NFC', student_name)
     try:
         with PILImage.open(image_path) as im:
             # Apply class-based rotation if specified
@@ -105,6 +134,7 @@ def create_student_entry(image_path, student_name, img_width, img_height, target
     name_style = ParagraphStyle(
         'StudentName',
         parent=styles['Normal'],
+        fontName=font_name,
         fontSize=8,
         leading=10,
         alignment=0,  # Left
@@ -118,7 +148,8 @@ def create_pdf():
     """Main function to create the PDF with two columns (image+name pairs)."""
     output_filename = "student_photos_list.pdf"
     print("🚀 Starting PDF generation...")
-
+    # Register Unicode font once
+    unicode_font = ensure_unicode_font()
     doc = SimpleDocTemplate(output_filename, pagesize=A4, topMargin=15 * mm, bottomMargin=15 * mm, leftMargin=15 * mm,
                             rightMargin=15 * mm)
 
@@ -147,6 +178,7 @@ def create_pdf():
     header_style = ParagraphStyle(
         'ClassHeader',
         parent=styles['Heading2'],
+        fontName=unicode_font,
         fontSize=16,
         spaceAfter=6,
         spaceBefore=12,
@@ -241,7 +273,17 @@ def create_pdf():
         sortable_entries = []  # (normalized_name, katalog, base_name, filename)
         for rec in deduped_records:
             sortable_entries.append((rec['normalized'], rec['katalog'], rec['base_name'], rec['filename']))
-        sortable_entries.sort(key=lambda x: x[0])
+
+        # Sort primarily by katalognummer (numeric ascending) where present; entries without katalog go after, sorted by name
+        def _sort_key(entry):
+            normalized, katalog, base_name, filename = entry
+            if katalog is not None:
+                try:
+                    return (0, int(katalog), normalized)
+                except ValueError:
+                    return (0, 9999, normalized)
+            return (1, normalized)
+        sortable_entries.sort(key=_sort_key)
 
         print(f"\n🏫 Processing class: {class_folder} (students: {len(sortable_entries)})" + (
             f" | 🔄 rotation {rotation_angle}°" if rotation_angle is not None else ""))
@@ -255,8 +297,9 @@ def create_pdf():
         for _, katalog, base_name, filename in sortable_entries:
             image_path = os.path.join(class_path, filename)
             display_name = f"{katalog} {base_name}" if katalog else base_name
+            display_name = unicodedata.normalize('NFC', display_name)
             img_flow, name_para = create_student_entry(image_path, display_name, max_img_width, max_img_height,
-                                                       rotation_angle=rotation_angle)
+                                                       rotation_angle=rotation_angle, font_name=unicode_font)
 
             # Append two cells (image then name)
             row.extend([img_flow, name_para])
