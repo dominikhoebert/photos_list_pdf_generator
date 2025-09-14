@@ -10,6 +10,17 @@ import unicodedata
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+# Attempt lazy import of OpenCV; proceed without cropping if unavailable
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None
+
+try:
+    import numpy as np  # Ensure numpy present for cv2 conversion
+except Exception:
+    np = None
+
 # Provide a Pillow-version-safe LANCZOS / high-quality resample filter
 try:
     RESAMPLE_LANCZOS = PILImage.Resampling.LANCZOS  # Pillow >= 9.1
@@ -18,8 +29,131 @@ except AttributeError:  # Older / different Pillow
 
 path = "Klassenfotos"
 
-rotation_class = {"2AHIT": 270, "2BHIT": 270, "3AHIT": 270, "4DHIT": 270}
+rotation_class = {"2AHIT": 270, "2BHIT": 270, "3AHIT": 270}
 remove_doubles = {"2BHIT": 1, "3AHIT": 1, "3CHIT": 1, "3DHIT": 1, "4BHIT": 1, "4CHIT": 1}
+
+# Global toggle for face cropping
+FACE_CROP_ENABLED = True
+# Minimum face size relative to image height to accept (avoid false tiny detections)
+MIN_FACE_REL_HEIGHT = 0.10  # 10%
+
+# Cached cascade classifier
+_HAAR_CASCADE = None
+
+def _load_face_cascade():
+    """Load (and cache) the OpenCV Haar cascade. Return classifier or None if unavailable."""
+    global _HAAR_CASCADE
+    if _HAAR_CASCADE is not None:
+        return _HAAR_CASCADE
+    if cv2 is None:
+        return None
+    try:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        if not os.path.isfile(cascade_path):
+            return None
+        _HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
+        if _HAAR_CASCADE.empty():
+            _HAAR_CASCADE = None
+        return _HAAR_CASCADE
+    except Exception:
+        return None
+
+
+def crop_image_to_face(pil_im: PILImage.Image, target_aspect: float) -> PILImage.Image:
+    """Detect the largest face and crop the image to a box with the given target_aspect (w/h).
+    Returns original image if detection fails.
+    Algorithm:
+      1. Detect faces (largest area kept).
+      2. Build a crop rectangle centered on face center with margin (scale factors) while enforcing aspect.
+      3. Ensure crop fits inside image; adjust if necessary.
+      4. If resulting crop would cut off too much (<= face bbox) still proceed; fallback only if detection invalid.
+    """
+    if not FACE_CROP_ENABLED or cv2 is None or np is None:
+        return pil_im
+    cascade = _load_face_cascade()
+    if cascade is None:
+        return pil_im
+
+    try:
+        im_rgb = pil_im.convert("RGB")
+        arr = np.array(im_rgb)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        # Improve contrast slightly
+        gray = cv2.equalizeHist(gray)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(60, 60))
+        if len(faces) == 0:
+            return pil_im
+        # Choose largest face by area
+        x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+        img_w, img_h = pil_im.size
+        # Reject too-small detections
+        if h / img_h < MIN_FACE_REL_HEIGHT:
+            return pil_im
+        # Face center
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        # Desired crop height with margin around face (tune factor)
+        desired_face_height_ratio = 0.55  # face occupies ~55% of crop height
+        crop_h = h / desired_face_height_ratio
+        # Clamp crop_h to image
+        crop_h = min(crop_h, img_h * 0.98)
+        # Corresponding width from aspect
+        crop_w = crop_h * target_aspect
+        # Ensure width covers face with margin horizontally comparable to vertical margin
+        min_width_for_face = w / 0.70  # face ~70% of width target
+        if crop_w < min_width_for_face:
+            crop_w = min_width_for_face
+            crop_h = crop_w / target_aspect
+        # If crop exceeds image bounds, shrink uniformly
+        scale = 1.0
+        if crop_w > img_w:
+            scale = min(scale, img_w / crop_w)
+        if crop_h > img_h:
+            scale = min(scale, img_h / crop_h)
+        if scale < 1.0:
+            crop_w *= scale
+            crop_h *= scale
+        # Top-left corner centered at face center
+        left = cx - crop_w / 2.0
+        top = cy - crop_h / 2.0
+        # Adjust to stay inside image
+        if left < 0:
+            left = 0
+        if top < 0:
+            top = 0
+        if left + crop_w > img_w:
+            left = img_w - crop_w
+        if top + crop_h > img_h:
+            top = img_h - crop_h
+        # Final integers
+        left_i = int(round(left))
+        top_i = int(round(top))
+        right_i = int(round(left + crop_w))
+        bottom_i = int(round(top + crop_h))
+        # Safety clamps
+        left_i = max(0, min(left_i, img_w - 1))
+        top_i = max(0, min(top_i, img_h - 1))
+        right_i = max(left_i + 1, min(right_i, img_w))
+        bottom_i = max(top_i + 1, min(bottom_i, img_h))
+        # Extra validation: aspect tolerance
+        final_w = right_i - left_i
+        final_h = bottom_i - top_i
+        if final_h == 0 or final_w == 0:
+            return pil_im
+        final_aspect = final_w / final_h
+        if not (0.90 * target_aspect <= final_aspect <= 1.10 * target_aspect):
+            # Minor adjust width to enforce aspect exactly
+            target_w_exact = int(round(final_h * target_aspect))
+            if target_w_exact <= img_w:
+                # Center horizontally within available (clamp)
+                new_left = int(max(0, min(left_i + (final_w - target_w_exact) / 2, img_w - target_w_exact)))
+                left_i = new_left
+                right_i = new_left + target_w_exact
+        cropped = pil_im.crop((left_i, top_i, right_i, bottom_i))
+        return cropped
+    except Exception:
+        return pil_im
+
 
 def extract_student_name(filename):
     """Extract student name from filename by removing number prefix and file extension"""
@@ -79,13 +213,13 @@ def create_student_entry(image_path, student_name, img_width, img_height, target
     Enhancements:
       * Optional forced rotation based on class (rotation_angle in degrees, applied if provided).
       * Otherwise, auto-rotate landscape images to portrait.
+      * Face detection crop to consistent aspect ratio (if enabled & face found).
       * Physically downscale image to fit (img_width,img_height) at target_dpi.
       * Keep JPEG (quality=80) to drastically lower in-memory size.
       * Use a Unicode-capable font for names.
     img_width / img_height are in POINTS (ReportLab). Converted to pixels using target_dpi.
     """
     styles = getSampleStyleSheet()
-    # Normalize display name to NFC to avoid combining mark issues (e.g. O8\u0308)
     student_name = unicodedata.normalize('NFC', student_name)
     try:
         with PILImage.open(image_path) as im:
@@ -96,48 +230,40 @@ def create_student_entry(image_path, student_name, img_width, img_height, target
                 except Exception as re:
                     print(f"⚠️  Rotation failed for {image_path}: {re}")
             else:
-                # Fallback heuristic rotate landscape images
                 if im.width > im.height:
                     im = im.rotate(90, expand=True)
-
+            # Face crop step (preserve aspect of allocated cell)
+            target_aspect = (img_width / img_height) if img_height else 0.75
+            im = crop_image_to_face(im, target_aspect=target_aspect)
             # Compute max pixel dimensions based on target DPI (points -> inches -> pixels)
             max_w_px = max(1, int(round((img_width / 72.0) * target_dpi)))
             max_h_px = max(1, int(round((img_height / 72.0) * target_dpi)))
-
-            # Downscale preserving aspect ratio
             if im.width > max_w_px or im.height > max_h_px:
                 im.thumbnail((max_w_px, max_h_px), RESAMPLE_LANCZOS)
-
-            # Calculate display size in points while preserving aspect ratio within bounding box
             ratio = im.width / im.height if im.height else 1
             disp_w = img_width
             disp_h = disp_w / ratio if ratio else img_height
             if disp_h > img_height:
                 disp_h = img_height
                 disp_w = disp_h * ratio
-
-            # Ensure RGB for JPEG
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
             elif im.mode == "L":
                 im = im.convert("RGB")
-
             buf = io.BytesIO()
             im.save(buf, format='JPEG', quality=80, optimize=True, progressive=True)
             buf.seek(0)
             img = Image(buf, width=disp_w, height=disp_h)
-
     except Exception as e:
         print(f"⚠️  Error loading image: {image_path} -> {e}")
         img = Paragraph("(kein Bild)", getSampleStyleSheet()['Normal'])
-
     name_style = ParagraphStyle(
         'StudentName',
         parent=styles['Normal'],
         fontName=font_name,
         fontSize=8,
         leading=10,
-        alignment=0,  # Left
+        alignment=0,
         spaceAfter=2,
     )
     name_para = Paragraph(student_name, name_style)
@@ -190,7 +316,7 @@ def create_pdf():
     max_img_height = 40 * mm
 
     # Table column widths: [img, name, img, name]
-    col_widths = [max_img_width, 45 * mm, max_img_width, 45 * mm]
+    col_widths = [max_img_width+3, 45 * mm, max_img_width+3, 45 * mm]
 
     processed = 0
 
@@ -326,7 +452,7 @@ def create_pdf():
         table = Table(table_data, colWidths=col_widths, hAlign='LEFT')
         table_style = TableStyle([
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 2),
             ('RIGHTPADDING', (0, 0), (-1, -1), 4),
             ('TOPPADDING', (0, 0), (-1, -1), 2),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
