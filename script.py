@@ -2,11 +2,16 @@ import os
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Image, Paragraph, Spacer, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch, mm
+from reportlab.lib.units import mm
 from reportlab.lib import colors
 from PIL import Image as PILImage
-import glob
 import io
+
+# Provide a Pillow-version-safe LANCZOS / high-quality resample filter
+try:
+    RESAMPLE_LANCZOS = PILImage.Resampling.LANCZOS  # Pillow >= 9.1
+except AttributeError:  # Older / different Pillow
+    RESAMPLE_LANCZOS = getattr(PILImage, 'LANCZOS', getattr(PILImage, 'BICUBIC', getattr(PILImage, 'NEAREST', 0)))
 
 path = "Klassenfotos"
 
@@ -21,6 +26,26 @@ def extract_student_name(filename):
     if len(parts) > 1 and parts[0].isdigit():
         return parts[1].replace('_', ' ')
     return name.replace('_', ' ')
+
+
+def parse_katalognummer_and_name(filename):
+    """Return (katalognummer(str or None), cleaned_name).
+    katalognummer: taken from leading numeric prefix before first underscore; padded to 2 digits.
+    cleaned_name: remaining parts joined with spaces, with any trailing purely numeric tokens removed (e.g., version markers like _2)."""
+    stem = os.path.splitext(filename)[0]
+    parts = stem.split('_')
+    if not parts:
+        return None, stem
+    katalog = None
+    remaining = parts
+    if parts[0].isdigit():
+        katalog = parts[0].zfill(2)
+        remaining = parts[1:]
+    while remaining and remaining[-1].isdigit():
+        remaining = remaining[:-1]
+    cleaned_name = ' '.join(remaining).strip()
+    cleaned_name = ' '.join(cleaned_name.split())  # collapse any repeated whitespace
+    return katalog, cleaned_name
 
 
 def create_student_entry(image_path, student_name, img_width, img_height, target_dpi=110, rotation_angle=None):
@@ -52,7 +77,7 @@ def create_student_entry(image_path, student_name, img_width, img_height, target
 
             # Downscale preserving aspect ratio
             if im.width > max_w_px or im.height > max_h_px:
-                im.thumbnail((max_w_px, max_h_px), PILImage.LANCZOS)
+                im.thumbnail((max_w_px, max_h_px), RESAMPLE_LANCZOS)
 
             # Calculate display size in points while preserving aspect ratio within bounding box
             ratio = im.width / im.height if im.height else 1
@@ -146,9 +171,16 @@ def create_pdf():
         if not files:
             print(f"ℹ️  Skipping empty class folder: {class_folder}")
             continue
-        files.sort()
+        # Sort by extracted student name (ignore katalog number prefixes)
+        sortable_entries = []  # (normalized_name, katalog, base_name, filename)
+        for f in files:
+            katalog, base_name = parse_katalognummer_and_name(f)
+            normalized = base_name.casefold()
+            sortable_entries.append((normalized, katalog, base_name, f))
+        sortable_entries.sort(key=lambda x: x[0])
 
-        print(f"\n🏫 Processing class: {class_folder} (students: {len(files)})" + (f" | 🔄 rotation {rotation_angle}°" if rotation_angle is not None else ""))
+        print(f"\n🏫 Processing class: {class_folder} (students: {len(sortable_entries)})" + (
+            f" | 🔄 rotation {rotation_angle}°" if rotation_angle is not None else ""))
 
         story.append(Paragraph(class_folder, header_style))
         story.append(Spacer(0, 4 * mm))
@@ -156,10 +188,11 @@ def create_pdf():
         table_data = []
         row = []  # Accumulate 4 cells per completed row (img, name, img, name)
 
-        for filename in files:
+        for _, katalog, base_name, filename in sortable_entries:
             image_path = os.path.join(class_path, filename)
-            student_name = extract_student_name(filename)
-            img_flow, name_para = create_student_entry(image_path, student_name, max_img_width, max_img_height, rotation_angle=rotation_angle)
+            display_name = f"{katalog} {base_name}" if katalog else base_name
+            img_flow, name_para = create_student_entry(image_path, display_name, max_img_width, max_img_height,
+                                                       rotation_angle=rotation_angle)
 
             # Append two cells (image then name)
             row.extend([img_flow, name_para])
@@ -169,7 +202,7 @@ def create_pdf():
                 pct = (processed / total_images) * 100
             else:
                 pct = 100.0
-            print(f"  ✅ [{processed}/{total_images}] {pct:5.1f}% -> {student_name}")
+            print(f"  ✅ [{processed}/{total_images}] {pct:5.1f}% -> {display_name}")
 
             if len(row) == 4:  # Completed one row (two students)
                 table_data.append(row)
