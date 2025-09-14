@@ -15,8 +15,8 @@ except AttributeError:  # Older / different Pillow
 
 path = "Klassenfotos"
 
-rotation_class = {"2AHIT": 270, "2BHIT": 270}
-
+rotation_class = {"2AHIT": 270, "2BHIT": 270, "3AHIT": 270}
+remove_doubles = {"2BHIT": 1, "3AHIT": 1, "3CHIT": 1, "3DHIT": 1, "4BHIT": 1, "4CHIT": 1}
 
 def extract_student_name(filename):
     """Extract student name from filename by removing number prefix and file extension"""
@@ -171,12 +171,76 @@ def create_pdf():
         if not files:
             print(f"ℹ️  Skipping empty class folder: {class_folder}")
             continue
-        # Sort by extracted student name (ignore katalog number prefixes)
-        sortable_entries = []  # (normalized_name, katalog, base_name, filename)
+
+        # --- Duplicate handling ---
+        # We consider files duplicates if katalog + cleaned base name (version number removed) match.
+        # Version suffix can be provided either as an underscore + digits (e.g., Name_2) or a space + digits (e.g., Name 2).
+        # For classes listed in remove_doubles with value==1 keep the variant that has the HIGHEST numeric version suffix.
+        grouped = {}
         for f in files:
             katalog, base_name = parse_katalognummer_and_name(f)
-            normalized = base_name.casefold()
-            sortable_entries.append((normalized, katalog, base_name, f))
+            key_katalog = katalog  # may be None
+            stem = os.path.splitext(f)[0]
+
+            # Detect underscore-based version suffix from original stem tokens (already partially handled by parse)
+            tokens_us = stem.split('_')
+            last_token_us = tokens_us[-1] if tokens_us else ''
+            underscore_numeric = last_token_us.isdigit()
+            underscore_version_num = int(last_token_us) if underscore_numeric else None
+
+            has_version_suffix = underscore_numeric
+            version_num = underscore_version_num
+
+            # If no underscore version detected, attempt space-based version suffix on the (possibly version-including) base_name
+            if not has_version_suffix:
+                space_parts = base_name.split()
+                if len(space_parts) > 1 and space_parts[-1].isdigit():
+                    version_num = int(space_parts[-1])
+                    has_version_suffix = True
+                    # Remove trailing numeric token for grouping/display
+                    base_name = ' '.join(space_parts[:-1]).strip()
+
+            # Grouping key uses katalog + casefold of base_name without trailing version number
+            grouping_key = (key_katalog, base_name.casefold())
+            grouped.setdefault(grouping_key, []).append({
+                'filename': f,
+                'katalog': katalog,
+                'base_name': base_name,  # version-stripped for display
+                'normalized': base_name.casefold(),
+                'has_version_suffix': has_version_suffix,
+                'version_num': version_num,
+                'stem': stem,
+            })
+
+        deduped_records = []
+        removed_count = 0
+        for key, variants in grouped.items():
+            if len(variants) == 1:
+                deduped_records.append(variants[0])
+                continue
+            strategy = remove_doubles.get(class_folder)
+            chosen = None
+            if strategy == 1:
+                # Prefer highest numeric version (space or underscore based)
+                with_version = [v for v in variants if v['has_version_suffix'] and v['version_num'] is not None]
+                if with_version:
+                    chosen = max(with_version, key=lambda v: v['version_num'])
+                else:
+                    chosen = sorted(variants, key=lambda v: v['filename'])[0]
+            else:
+                chosen = sorted(variants, key=lambda v: v['filename'])[0]
+            for v in variants:
+                if v is not chosen:
+                    removed_count += 1
+                    print(f"   🗑️  Duplicate removed in {class_folder}: {v['filename']} (kept {chosen['filename']})")
+            deduped_records.append(chosen)
+        if removed_count:
+            print(f"   ➖ Duplicates filtered: {removed_count} removed in {class_folder}")
+
+        # Build sortable entries from deduped records
+        sortable_entries = []  # (normalized_name, katalog, base_name, filename)
+        for rec in deduped_records:
+            sortable_entries.append((rec['normalized'], rec['katalog'], rec['base_name'], rec['filename']))
         sortable_entries.sort(key=lambda x: x[0])
 
         print(f"\n🏫 Processing class: {class_folder} (students: {len(sortable_entries)})" + (
