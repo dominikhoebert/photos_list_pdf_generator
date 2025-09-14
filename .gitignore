@@ -258,3 +258,5 @@ cython_debug/
 #.idea/
 
 Klassenfotos/
+Klassenfotos_test/
+student_photos_list.pdf
