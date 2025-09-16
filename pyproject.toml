@@ -1,0 +1,12 @@
+[project]
+name = "photos-list-pdf-generator"
+version = "0.1.0"
+description = "Generate a neatly formatted PDF contact sheet of student photos grouped by class folders"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26.0",
+    "opencv-python-headless>=4.10.0.0",
+    "pillow>=10.0.0",
+    "reportlab>=4.0.0",
+]
