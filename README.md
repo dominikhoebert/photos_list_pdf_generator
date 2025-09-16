@@ -25,7 +25,7 @@ Klassenfotos/
   2AHIT/
     1_Abdel-Latif_Zainab.JPG
 script.py
-requirements.txt
+pyproject.toml
 student_photos_list.pdf (output after running)
 ```
 
@@ -51,9 +51,9 @@ python -m venv .venv
 .venv\Scripts\activate        # Windows PowerShell
 # source .venv/bin/activate    # Linux / macOS
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install .
 ```
-Minimal install (skip face cropping to avoid OpenCV): remove the `opencv-python-headless` line from `requirements.txt` before installing, then set `FACE_CROP_ENABLED = False` in `script.py`.
+Minimal install (skip face cropping to avoid OpenCV): remove the `opencv-python-headless` line from `pyproject.toml` before installing, then set `FACE_CROP_ENABLED = False` in `script.py`.
 
 ## Usage
 Place your class folders and images inside `Klassenfotos/` (same directory as `script.py`). Then run:
@@ -180,7 +180,7 @@ Add your preferred license (e.g., MIT) here.
 ```
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install .
 python script.py
 start student_photos_list.pdf   # Windows only; use 'open' on macOS
 ```
