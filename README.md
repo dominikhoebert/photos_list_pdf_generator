@@ -60,6 +60,10 @@ Place your class folders and images inside `Klassenfotos/` (same directory as `s
 ```
 python script.py
 ```
+If you use [`uv`](https://docs.astral.sh/uv/), you can run the following without prior installation:
+```
+uv run script.py
+```
 Output: `student_photos_list.pdf` in the project root.
 
 ### Command-Line Arguments
@@ -182,6 +186,11 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install .
 python script.py
+start student_photos_list.pdf   # Windows only; use 'open' on macOS
+```
+Or alternatively
+```
+uv run script.py
 start student_photos_list.pdf   # Windows only; use 'open' on macOS
 ```
 
